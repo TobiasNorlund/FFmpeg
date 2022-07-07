@@ -1,0 +1,21 @@
+// For format details, see https://aka.ms/devcontainer.json. For config options, see the README at:
+// https://github.com/microsoft/vscode-dev-containers/tree/v0.238.0/containers/docker-existing-dockerfile
+{
+	"name": "FFmpeg devcontainer",
+	"build": {
+		"context": "..",
+		"dockerfile": "Dockerfile",
+		"args": {
+			"DOCKER_UID": "1000",  // Just set a uid/gid, as vs code will override to user's actual uid/gid automatically
+            "DOCKER_GID": "1000"
+		}
+	},
+
+	"remoteUser": "docker-user",
+	"mounts": ["source=/tmp/.X11-unix,target=/tmp/.X11-unix,type=bind"],
+	"containerEnv": {
+		"DISPLAY": "${localEnv:DISPLAY}"
+	},
+	"runArgs": ["--ipc", "host"]
+
+}

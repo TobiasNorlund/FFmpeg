@@ -73,6 +73,8 @@ typedef struct XCBGrabContext {
     int centered;
     int select_region;
 
+    int output_mouse_coordinates;
+
     const char *framerate;
 
     int has_shm;
@@ -97,6 +99,7 @@ static const AVOption options[] = {
     { "show_region", "Show the grabbing region.", OFFSET(show_region), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 1, D },
     { "region_border", "Set the region border thickness.", OFFSET(region_border), AV_OPT_TYPE_INT, { .i64 = 3 }, 1, 128, D },
     { "select_region", "Select the grabbing region graphically using the pointer.", OFFSET(select_region), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, D },
+    { "output_mouse_coordinates", "Whether to write mouse coordinates to stdout or not", OFFSET(output_mouse_coordinates), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, D},
     { NULL },
 };
 
@@ -356,6 +359,9 @@ static void xcbgrab_draw_mouse(AVFormatContext *s, AVPacket *pkt,
 
     x = FFMAX(cx, win_x + gr->x);
     y = FFMAX(cy, win_y + gr->y);
+
+    if (gr->output_mouse_coordinates)
+        printf("%d,%d\n", x, y);
 
     w = FFMIN(cx + ci->width,  win_x + gr->x + gr->width)  - x;
     h = FFMIN(cy + ci->height, win_y + gr->y + gr->height) - y;
