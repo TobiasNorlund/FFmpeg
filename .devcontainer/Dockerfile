@@ -1,4 +1,4 @@
-FROM nvidia/cuda:11.3.1-devel-ubuntu20.04
+FROM nvidia/cuda:11.3.1-devel-ubuntu20.04 AS ffmpeg-dev
 
 ARG DOCKER_UID
 ARG DOCKER_GID
@@ -22,3 +22,14 @@ ENV LANG C.UTF-8
 ENV LC_ALL C.UTF-8
 
 USER $DOCKER_UID:$DOCKER_GID
+
+
+
+FROM ffmpeg-dev AS ffmpeg-install
+
+USER root:root
+COPY . /FFmpeg/
+WORKDIR /FFmpeg/
+RUN ./configure --enable-gpl --enable-libx264 --prefix=/opt/ffmpeg
+RUN make -j 8
+RUN make install
