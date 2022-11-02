@@ -25,6 +25,10 @@
 #include <string.h>
 #include <xcb/xcb.h>
 
+#include <X11/Xlib.h>
+#include <X11/Xlibint.h>
+#include <X11/extensions/record.h>
+
 #if CONFIG_LIBXCB_XFIXES
 #include <xcb/xfixes.h>
 #endif
@@ -47,12 +51,21 @@
 #include "libavformat/avformat.h"
 #include "libavformat/internal.h"
 
+
+typedef struct LinkedEvent {
+    char type[14];
+    int code;
+    struct LinkedEvent* next;
+} LinkedEvent;
+
+
 typedef struct XCBGrabContext {
     const AVClass *class;
 
     xcb_connection_t *conn;
     xcb_screen_t *screen;
     xcb_window_t window;
+
 #if CONFIG_LIBXCB_SHM
     AVBufferPool *shm_pool;
 #endif
@@ -73,12 +86,19 @@ typedef struct XCBGrabContext {
     int centered;
     int select_region;
 
-    int output_mouse_coordinates;
-
     const char *framerate;
 
     int has_shm;
-} XCBGrabContext;
+
+    // Record stuff
+    Bool record_events;
+    Display *data_disp;
+    Display *ctrl_disp;
+    int cur_x, cur_y;
+    LinkedEvent* events;
+
+} XCBGrabContext; 
+
 
 #define FOLLOW_CENTER -1
 
@@ -99,7 +119,7 @@ static const AVOption options[] = {
     { "show_region", "Show the grabbing region.", OFFSET(show_region), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 1, D },
     { "region_border", "Set the region border thickness.", OFFSET(region_border), AV_OPT_TYPE_INT, { .i64 = 3 }, 1, 128, D },
     { "select_region", "Select the grabbing region graphically using the pointer.", OFFSET(select_region), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, D },
-    { "output_mouse_coordinates", "Whether to write mouse coordinates to stdout or not", OFFSET(output_mouse_coordinates), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, D},
+    { "record_events", "Whether to record events and output them as json to stdout", OFFSET(record_events), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, D},
     { NULL },
 };
 
@@ -110,6 +130,23 @@ static const AVClass xcbgrab_class = {
     .version    = LIBAVUTIL_VERSION_INT,
     .category   = AV_CLASS_CATEGORY_DEVICE_VIDEO_INPUT,
 };
+
+
+void x_event_callback (XPointer, XRecordInterceptData*);
+LinkedEvent* get_last_event(LinkedEvent* event);
+void free_linked_events(struct LinkedEvent* head);
+void print_recorded_events_json(XCBGrabContext* c);
+
+/* for this struct, refer to libxnee */
+typedef union {
+    unsigned char    type ;
+    xEvent           event ;
+    xResourceReq     req   ;
+    xGenericReply    reply ;
+    xError           error ;
+    xConnSetupPrefix setup;
+} XRecordDatum;
+
 
 static int xcbgrab_reposition(AVFormatContext *s,
                               xcb_query_pointer_reply_t *p,
@@ -360,8 +397,9 @@ static void xcbgrab_draw_mouse(AVFormatContext *s, AVPacket *pkt,
     x = FFMAX(cx, win_x + gr->x);
     y = FFMAX(cy, win_y + gr->y);
 
-    if (gr->output_mouse_coordinates)
-        printf("%d,%d\n", x, y);
+    // Save cursor position for recording
+    gr->cur_x = x;
+    gr->cur_y = y;
 
     w = FFMIN(cx + ci->width,  win_x + gr->x + gr->width)  - x;
     h = FFMIN(cy + ci->height, win_y + gr->y + gr->height) - y;
@@ -433,6 +471,13 @@ static int xcbgrab_read_packet(AVFormatContext *s, AVPacket *pkt)
     wait_frame(s, pkt);
     pts = av_gettime();
 
+    // Fetch any available events and store in XCBGrabContext
+    if (c->record_events){
+        free_linked_events(c->events);
+        c->events = NULL;
+        XRecordProcessReplies (c->data_disp);
+    }
+
     if (c->follow_mouse || c->draw_mouse) {
         pc  = xcb_query_pointer(c->conn, c->window_id);
         gc  = xcb_get_geometry(c->conn, c->window_id);
@@ -483,6 +528,10 @@ static int xcbgrab_read_packet(AVFormatContext *s, AVPacket *pkt)
     if (ret >= 0 && c->draw_mouse && p->same_screen)
         xcbgrab_draw_mouse(s, pkt, p, geo, win_x, win_y);
 #endif
+
+    // Output any events
+    if (c->record_events)
+        print_recorded_events_json(c);
 
     free(p);
     free(geo);
@@ -619,6 +668,7 @@ static int create_stream(AVFormatContext *s)
 
     c->time_base  = (AVRational){ st->avg_frame_rate.den,
                                   st->avg_frame_rate.num };
+    //printf("time_base: %d/%d", st->avg_frame_rate.num, st->avg_frame_rate.den);
     c->frame_duration = av_rescale_q(1, c->time_base, AV_TIME_BASE_Q);
     c->time_frame = av_gettime_relative();
 
@@ -820,6 +870,53 @@ fail:
     return ret;
 }
 
+static void setup_event_recording(XCBGrabContext *c)
+{
+    int major, minor;
+    XRecordRange  *rr;
+    XRecordClientSpec  rcs;
+    XRecordContext   rc;
+
+    c->ctrl_disp = XOpenDisplay (NULL);
+    c->data_disp = XOpenDisplay (NULL);
+
+    if (!c->ctrl_disp || !c->data_disp) {
+        fprintf (stderr, "Error to open local display!\n");
+        exit (1);
+    }
+
+    // we must set the ctrl_disp to sync mode, or, when we the enalbe 
+    // context in data_disp, there will be a fatal X error !!!
+    XSynchronize(c->ctrl_disp,True);
+
+    if (!XRecordQueryVersion (c->ctrl_disp, &major, &minor)) {
+        fprintf (stderr, "RECORD extension not supported on this X server!\n");
+        exit (2);
+    }
+    fprintf (stderr, "RECORD extension for local server is version is %d.%d\n", major, minor);
+
+    rr = XRecordAllocRange ();
+    if (!rr) {
+        fprintf (stderr, "Could not alloc record range object!\n");
+        exit (3);
+    }
+
+    rr->device_events.first = ButtonPress;
+    rr->device_events.last = ButtonRelease;
+    rcs = XRecordAllClients;
+
+    rc = XRecordCreateContext (c->ctrl_disp, 0, &rcs, 1, &rr, 1);
+    if (!rc) {
+        fprintf (stderr, "Could not create a record context!\n");
+        exit (4);
+    }
+
+    if (!XRecordEnableContextAsync (c->data_disp, rc, x_event_callback, (XPointer)c)) {
+        fprintf (stderr, "Cound not enable the record context!\n");
+        exit (5);
+    }
+}
+
 static av_cold int xcbgrab_read_header(AVFormatContext *s)
 {
     XCBGrabContext *c = s->priv_data;
@@ -882,6 +979,10 @@ static av_cold int xcbgrab_read_header(AVFormatContext *s)
         return ret;
     }
 
+    // Setup recording
+    if (c->record_events)
+        setup_event_recording(c);
+
 #if CONFIG_LIBXCB_SHM
     c->has_shm = check_shm(c->conn);
 #endif
@@ -905,6 +1006,118 @@ static av_cold int xcbgrab_read_header(AVFormatContext *s)
 
     return 0;
 }
+
+
+LinkedEvent* get_last_event(LinkedEvent* event)
+{
+    if (!event->next)
+        return event;
+    else
+        return get_last_event(event->next);
+}
+
+void free_linked_events(struct LinkedEvent* head)
+{
+   struct LinkedEvent* tmp;
+   while (head != NULL)
+   {
+       tmp = head;
+       head = head->next;
+       free(tmp);
+   }
+}
+
+void print_recorded_events_json(XCBGrabContext* c)
+{
+    LinkedEvent* ev;
+    printf("{\"cur_x\":%d,\"cur_y\":%d", c->cur_x, c->cur_y);
+    if (c->events){
+        printf(",\"events\":[");
+        ev = c->events;
+        while(ev) {
+            printf("{\"type\":\"%s\",\"code\":%d}", ev->type, ev->code);
+            ev = ev->next;
+            if (ev) printf(",");
+        }
+        printf("]");
+    }
+    printf("}\n");
+}
+
+void x_event_callback(XPointer priv, XRecordInterceptData *hook)
+{
+    XRecordDatum *data;
+    int event_type;
+    BYTE code;
+    LinkedEvent* event = NULL;
+    LinkedEvent* last_event = NULL;
+    XCBGrabContext* c = (XCBGrabContext*)priv;
+
+    if (hook->category != XRecordFromServer) {
+        XRecordFreeData (hook);
+        return;
+    }
+
+    data = (XRecordDatum*) hook->data;
+    event_type = data->type;
+    code = data->event.u.u.detail;
+
+    switch (event_type) {
+        case ButtonPress:
+            //printf ("ButtonPress: %d\n", code);
+            event = (LinkedEvent *) malloc(sizeof(LinkedEvent));
+            strcpy(event->type, "ButtonPress"); 
+            event->code = code;
+            event->next = NULL;
+            break;
+        case ButtonRelease:
+            //printf ("ButtonRelease: %d\n", code);
+            event = (LinkedEvent *) malloc(sizeof(LinkedEvent));
+            strcpy(event->type, "ButtonRelease"); 
+            event->code = code;
+            event->next = NULL;
+            break;
+        /*case KeyPress:
+            // if escape is pressed, stop the loop and clean up, then exit 
+            printf("%x", keycode);
+            //if (keycode == 9) stop = 1;
+
+            // Note: you should not use data_disp to do normal X operations !!!
+            printf ("KeyPress: \t%s\n", XKeysymToString(XKeycodeToKeysym(c->ctrl_disp, keycode, 0)));
+            break;
+        case KeyRelease:
+            printf ("KeyRelease: \t%s\n", XKeysymToString(XKeycodeToKeysym(c->ctrl_disp, keycode, 0)));
+            break;
+
+        case MotionNotify:
+            // printf ("MouseMove: /trootX=%d, rootY=%d",rootx, rooty); 
+            //cur_x = rootx;
+            //cur_y = rooty;
+            break;
+        case CreateNotify:
+            break;
+        case DestroyNotify:
+            break;
+        case NoExpose:
+            break;
+        case Expose:
+            break;
+        default:
+            break;*/
+    }
+
+    if (event) {
+        if (!c->events) {
+            c->events = event;
+        } else {
+            last_event = get_last_event(c->events);
+            last_event->next = event;
+        }
+    }
+
+    XRecordFreeData (hook);
+}
+
 
 const AVInputFormat ff_xcbgrab_demuxer = {
     .name           = "x11grab",

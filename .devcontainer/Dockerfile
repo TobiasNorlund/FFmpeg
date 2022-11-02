@@ -12,7 +12,9 @@ RUN apt update && DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt install -y \
     # nvidia cuda deps (https://docs.nvidia.com/video-technologies/video-codec-sdk/ffmpeg-with-nvidia-gpu/)
     libc6 libc6-dev unzip wget libnuma1 libnuma-dev \
     # x264 dep (https://trac.ffmpeg.org/wiki/CompilationGuide/Ubuntu#libx264)
-    libx264-dev
+    libx264-dev \
+    # X extenstions (added by Tobias)
+    libxtst-dev xcb libxcb-xkb-dev x11-xkb-utils libx11-xcb-dev libxkbcommon-x11-dev libxcb-record0-dev
 
 RUN passwd -d docker-user && adduser docker-user sudo
 
