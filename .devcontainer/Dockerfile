@@ -32,6 +32,6 @@ FROM ffmpeg-dev AS ffmpeg-install
 USER root:root
 COPY . /FFmpeg/
 WORKDIR /FFmpeg/
-RUN ./configure --enable-gpl --enable-libx264 --prefix=/opt/ffmpeg
+RUN ./configure --enable-gpl --enable-libx264 --extra-libs=-lXtst --prefix=/opt/ffmpeg
 RUN make -j 8
 RUN make install
