@@ -33,6 +33,7 @@
 #include "libavutil/opt.h"
 #include "libavutil/time.h"
 #include "libavutil/wchar_filename.h"
+#include <pthread.h>
 #include <windows.h>
 
 /** 
@@ -79,19 +80,11 @@ struct gdigrab {
     // Record stuff
     int record_events;
     int cur_x, cur_y;
-    unsigned short* prev_vk_state;
+    HANDLE hThread;
+    HHOOK g_hMouseHook;
+    HHOOK g_hKeyboardHook;
+    pthread_mutex_t mutex;
     LinkedEvent* events;
-};
-
-
-static int RECORD_VK_IDS[] = {
-    VK_LBUTTON,
-    VK_RBUTTON
-};
-
-static int RECORD_VK_CODES[] = {
-    0, // left mouse cbutton
-    1  // right mouse button
 };
 
 
@@ -152,7 +145,7 @@ get_last_event(LinkedEvent* event)
  * Creates a new event
  */
 static LinkedEvent*
-new_linked_event(char type[], int code)
+new_linked_event(const char type[], int code)
 {
     LinkedEvent* event = (LinkedEvent *) malloc(sizeof(LinkedEvent));
     strcpy(event->type, type);
@@ -160,68 +153,124 @@ new_linked_event(char type[], int code)
     event->next = NULL;
     return event;
 }
- 
 
 /**
- * Record events in gdigrab object
- */
-static void
-record_events(struct gdigrab* gdigrab)
+ * Callback for mouse messages
+*/
+static LRESULT CALLBACK 
+mouse_hook(int nCode, WPARAM wParam, LPARAM lParam)
 {
-    /* Update prev_vk_state */
-    unsigned short state;
-    char v;
-    LinkedEvent* last_event = NULL;
-    
-    char btn_press_type[] = "ButtonPress";
-    char btn_release_type[] = "ButtonRelease";
-
-    for (int i = 0; i < sizeof(RECORD_VK_IDS)/sizeof(RECORD_VK_IDS[0]); i++) {
-        LinkedEvent* event = NULL;
-        state = GetAsyncKeyState(RECORD_VK_IDS[i]);
-        v = (gdigrab->prev_vk_state[i] >> 13) | (state >> 14) | (state & 0x1); 
-        gdigrab->prev_vk_state[i] = state;
-
-        switch (v) {
-            case 1:
-                // ButtonPress + ButtonRelease
-                event = new_linked_event(btn_press_type, RECORD_VK_CODES[i]);
-                event->next = new_linked_event(btn_release_type, RECORD_VK_CODES[i]);
+    struct gdigrab* gdigrab = (struct gdigrab*)GetMessageExtraInfo();
+    LinkedEvent* event = NULL;
+    if (nCode == HC_ACTION)
+    {
+        MSLLHOOKSTRUCT* pMouseStruct = (MSLLHOOKSTRUCT*)lParam;
+        switch (wParam)
+        {
+            case WM_LBUTTONDOWN:
+                event = new_linked_event("ButtonPress", 0);
                 break;
-            case 3:
-                // ButtonPress
-                event = new_linked_event(btn_press_type, RECORD_VK_CODES[i]);
+            case WM_LBUTTONUP:
+                event = new_linked_event("ButtonRelease", 0);
                 break;
-            case 4:
-                // ButtonRelease
-                event = new_linked_event(btn_release_type, RECORD_VK_CODES[i]);
+            case WM_RBUTTONDOWN:
+                event = new_linked_event("ButtonPress", 1);
                 break;
-            case 5:
-                // ButtonRelease + ButtonPress + ButtonRelease
-                event = new_linked_event(btn_release_type, RECORD_VK_CODES[i]);
-                event->next = new_linked_event(btn_press_type, RECORD_VK_CODES[i]);
-                event->next->next = new_linked_event(btn_release_type, RECORD_VK_CODES[i]);
+            case WM_RBUTTONUP:
+                event = new_linked_event("ButtonRelease", 1);
                 break;
-            case 7:
-                // ButtonRelease + ButtonPress + ButtonRelease + ButtonPress
-                event = new_linked_event(btn_release_type, RECORD_VK_CODES[i]);
-                event->next = new_linked_event(btn_press_type, RECORD_VK_CODES[i]);
-                event->next->next = new_linked_event(btn_release_type, RECORD_VK_CODES[i]);
-                event->next->next->next = new_linked_event(btn_press_type, RECORD_VK_CODES[i]);
+            case WM_MOUSEWHEEL:
+                int delta = GET_WHEEL_DELTA_WPARAM(pMouseStruct->mouseData);
+                event = new_linked_event("MouseScroll", delta);
                 break;
         }
-
         if (event != NULL) {
-            if (gdigrab->events == NULL)
+            pthread_mutex_lock(&(gdigrab->mutex));
+            if (gdigrab->events == NULL) {
                 gdigrab->events = event;
-
-            if (last_event == NULL)
-                last_event = get_last_event(event);
-            else
-                last_event->next = get_last_event(event);
+            } else {
+                LinkedEvent* last_event = get_last_event(gdigrab->events);
+                last_event->next = event;
+            }
+            pthread_mutex_unlock(&(gdigrab->mutex));
         }
     }
+    return CallNextHookEx(gdigrab->g_hMouseHook, nCode, wParam, lParam);
 }
+
+/**
+ * Callback for keyboard messages
+*/
+static LRESULT CALLBACK 
+keyboard_hook(int nCode, WPARAM wParam, LPARAM lParam)
+{
+    struct gdigrab* gdigrab = (struct gdigrab*)GetMessageExtraInfo();
+    LinkedEvent* event = NULL;
+    if (nCode == HC_ACTION)
+    {
+        KBDLLHOOKSTRUCT* pKeyboardStruct = (KBDLLHOOKSTRUCT*)lParam;
+        switch (wParam)
+        {
+            case WM_KEYDOWN:
+            {
+                event = new_linked_event("KeyPress", pKeyboardStruct->vkCode);
+                break;
+            }
+            case WM_KEYUP:
+            {
+                event = new_linked_event("KeyRelease", pKeyboardStruct->vkCode);
+                break;
+            }
+        }
+        if (event != NULL) {
+            pthread_mutex_lock(&(gdigrab->mutex));
+            if (gdigrab->events == NULL) {
+                gdigrab->events = event;
+            } else {
+                LinkedEvent* last_event = get_last_event(gdigrab->events);
+                last_event->next = event;
+            }
+            pthread_mutex_unlock(&(gdigrab->mutex));
+        }
+    }
+
+    return CallNextHookEx(gdigrab->g_hKeyboardHook, nCode, wParam, lParam);
+}
+
+/**
+ * Message Loop. Runs in separate thread and populates 
+*/
+static DWORD WINAPI 
+message_loop(struct gdigrab* gdigrab)
+{
+    MSG msg;
+    gdigrab->g_hMouseHook = SetWindowsHookEx(WH_MOUSE_LL, mouse_hook, NULL, 0);
+    if (gdigrab->g_hMouseHook == NULL)
+    {
+        printf("SetWindowsHookEx for mouse hook failed.\n");
+        return 1;
+    }
+    gdigrab->g_hKeyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, keyboard_hook, NULL, 0);
+    if (gdigrab->g_hKeyboardHook == NULL)
+    {
+        printf("SetWindowsHookEx failed.\n");
+        return 1;
+    }
+
+    // Use extra info to pass gdigrab object to callbacks
+    SetMessageExtraInfo((LPARAM)gdigrab);
+
+    while (GetMessage(&msg, NULL, 0, 0))
+    {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+
+    UnhookWindowsHookEx(gdigrab->g_hMouseHook);
+    UnhookWindowsHookEx(gdigrab->g_hKeyboardHook);
+    return 0;
+}
+
 
 /**
  * Callback to handle Windows messages for the region outline window.
@@ -578,12 +627,24 @@ gdigrab_read_header(AVFormatContext *s1)
     }
 
     if (gdigrab->record_events) {
-        int len = sizeof(RECORD_VK_IDS) / 4; // int -> 4 bytes,
-        gdigrab->prev_vk_state = malloc(len * 2); // short -> 2 bytes
-        memset(gdigrab->prev_vk_state, 0, len * 2);
-        record_events(gdigrab);
-    }
+        // Create mutex
+        if (pthread_mutex_init(&gdigrab->mutex, NULL) != 0)
+        {
+            printf("\n mutex init failed\n");
+            return 1;
+        }
 
+        // Setup message loop in separate thread
+        gdigrab->hThread = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)message_loop, gdigrab, 0, NULL);
+        if (gdigrab->hThread == NULL) {
+            printf("CreateThread failed.\n");
+            return 1;
+        }
+
+        // Init events list
+        gdigrab->events = NULL;
+    }
+    
     st->avg_frame_rate = av_inv_q(gdigrab->time_base);
 
     st->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
@@ -761,10 +822,11 @@ static int gdigrab_read_packet(AVFormatContext *s1, AVPacket *pkt)
 
     /* Record and print events */
     if (gdigrab->record_events){
+        pthread_mutex_lock(&(gdigrab->mutex));
+        print_recorded_events_json(gdigrab);
         free_linked_events(gdigrab->events);
         gdigrab->events = NULL;
-        record_events(gdigrab);
-        print_recorded_events_json(gdigrab);
+        pthread_mutex_unlock(&(gdigrab->mutex));
     }
 
     /* Copy bits to packet data */
