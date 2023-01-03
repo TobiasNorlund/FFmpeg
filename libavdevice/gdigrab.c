@@ -90,8 +90,8 @@ static int RECORD_VK_IDS[] = {
 };
 
 static int RECORD_VK_CODES[] = {
-    0,
-    1
+    0, // left mouse cbutton
+    1  // right mouse button
 };
 
 
@@ -102,7 +102,7 @@ static int RECORD_VK_CODES[] = {
 
 /**
  * Print events as json line
-*/
+ */
 static void
 print_recorded_events_json(struct gdigrab* c)
 {
@@ -581,6 +581,7 @@ gdigrab_read_header(AVFormatContext *s1)
         int len = sizeof(RECORD_VK_IDS) / 4; // int -> 4 bytes,
         gdigrab->prev_vk_state = malloc(len * 2); // short -> 2 bytes
         memset(gdigrab->prev_vk_state, 0, len * 2);
+        record_events(gdigrab);
     }
 
     st->avg_frame_rate = av_inv_q(gdigrab->time_base);
@@ -634,8 +635,11 @@ static void paint_mouse_pointer(AVFormatContext *s1, struct gdigrab *gdigrab)
         info.hbmMask = NULL;
         info.hbmColor = NULL;
 
-        if (ci.flags != CURSOR_SHOWING)
+        if (ci.flags != CURSOR_SHOWING) {
+            gdigrab->cur_x = -1;
+            gdigrab->cur_y = -1;
             return;
+        }
 
         if (!icon) {
             /* Use the standard arrow cursor as a fallback.
