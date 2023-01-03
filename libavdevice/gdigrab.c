@@ -35,6 +35,16 @@
 #include "libavutil/wchar_filename.h"
 #include <windows.h>
 
+/** 
+ * Linked list for events
+ */
+typedef struct LinkedEvent {
+    char type[14];
+    int code;
+    struct LinkedEvent* next;
+} LinkedEvent;
+
+
 /**
  * GDI Device Demuxer context
  */
@@ -65,12 +75,153 @@ struct gdigrab {
     HWND       region_hwnd; /**< Handle of the region border window */
 
     int cursor_error_printed;
+
+    // Record stuff
+    int record_events;
+    int cur_x, cur_y;
+    unsigned short* prev_vk_state;
+    LinkedEvent* events;
 };
+
+
+static int RECORD_VK_IDS[] = {
+    VK_LBUTTON,
+    VK_RBUTTON
+};
+
+static int RECORD_VK_CODES[] = {
+    0,
+    1
+};
+
 
 #define WIN32_API_ERROR(str)                                            \
     av_log(s1, AV_LOG_ERROR, str " (error %li)\n", GetLastError())
 
 #define REGION_WND_BORDER 3
+
+/**
+ * Print events as json line
+*/
+static void
+print_recorded_events_json(struct gdigrab* c)
+{
+    LinkedEvent* ev;
+    printf("{\"cur_x\":%d,\"cur_y\":%d", c->cur_x, c->cur_y);
+    if (c->events){
+        printf(",\"events\":[");
+        ev = c->events;
+        while(ev) {
+            printf("{\"type\":\"%s\",\"code\":%d}", ev->type, ev->code);
+            ev = ev->next;
+            if (ev) printf(",");
+        }
+        printf("]");
+    }
+    printf("}\n");
+}
+
+/**
+ * Free events memory
+*/
+static void
+free_linked_events(struct LinkedEvent* head)
+{
+   struct LinkedEvent* tmp;
+   while (head != NULL)
+   {
+       tmp = head;
+       head = head->next;
+       free(tmp);
+   }
+}
+
+/**
+ * Gets the last event in a LinkedEvent list
+ */
+static LinkedEvent* 
+get_last_event(LinkedEvent* event)
+{
+    if (!event->next)
+        return event;
+    else
+        return get_last_event(event->next);
+}
+
+/**
+ * Creates a new event
+ */
+static LinkedEvent*
+new_linked_event(char type[], int code)
+{
+    LinkedEvent* event = (LinkedEvent *) malloc(sizeof(LinkedEvent));
+    strcpy(event->type, type);
+    event->code = code;
+    event->next = NULL;
+    return event;
+}
+ 
+
+/**
+ * Record events in gdigrab object
+ */
+static void
+record_events(struct gdigrab* gdigrab)
+{
+    /* Update prev_vk_state */
+    unsigned short state;
+    char v;
+    LinkedEvent* last_event = NULL;
+    
+    char btn_press_type[] = "ButtonPress";
+    char btn_release_type[] = "ButtonRelease";
+
+    for (int i = 0; i < sizeof(RECORD_VK_IDS)/sizeof(RECORD_VK_IDS[0]); i++) {
+        LinkedEvent* event = NULL;
+        state = GetAsyncKeyState(RECORD_VK_IDS[i]);
+        v = (gdigrab->prev_vk_state[i] >> 13) | (state >> 14) | (state & 0x1); 
+        gdigrab->prev_vk_state[i] = state;
+
+        switch (v) {
+            case 1:
+                // ButtonPress + ButtonRelease
+                event = new_linked_event(btn_press_type, RECORD_VK_CODES[i]);
+                event->next = new_linked_event(btn_release_type, RECORD_VK_CODES[i]);
+                break;
+            case 3:
+                // ButtonPress
+                event = new_linked_event(btn_press_type, RECORD_VK_CODES[i]);
+                break;
+            case 4:
+                // ButtonRelease
+                event = new_linked_event(btn_release_type, RECORD_VK_CODES[i]);
+                break;
+            case 5:
+                // ButtonRelease + ButtonPress + ButtonRelease
+                event = new_linked_event(btn_release_type, RECORD_VK_CODES[i]);
+                event->next = new_linked_event(btn_press_type, RECORD_VK_CODES[i]);
+                event->next->next = new_linked_event(btn_release_type, RECORD_VK_CODES[i]);
+                break;
+            case 7:
+                // ButtonRelease + ButtonPress + ButtonRelease + ButtonPress
+                event = new_linked_event(btn_release_type, RECORD_VK_CODES[i]);
+                event->next = new_linked_event(btn_press_type, RECORD_VK_CODES[i]);
+                event->next->next = new_linked_event(btn_release_type, RECORD_VK_CODES[i]);
+                event->next->next->next = new_linked_event(btn_press_type, RECORD_VK_CODES[i]);
+                break;
+        }
+
+        if (event != NULL) {
+            if (gdigrab->events == NULL)
+                gdigrab->events = event;
+
+            if (last_event == NULL)
+                last_event = get_last_event(event);
+            else
+                last_event->next = get_last_event(event);
+        }
+    }
+}
 
 /**
  * Callback to handle Windows messages for the region outline window.
@@ -426,6 +577,12 @@ gdigrab_read_header(AVFormatContext *s1)
         }
     }
 
+    if (gdigrab->record_events) {
+        int len = sizeof(RECORD_VK_IDS) / 4; // int -> 4 bytes,
+        gdigrab->prev_vk_state = malloc(len * 2); // short -> 2 bytes
+        memset(gdigrab->prev_vk_state, 0, len * 2);
+    }
+
     st->avg_frame_rate = av_inv_q(gdigrab->time_base);
 
     st->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
@@ -512,6 +669,9 @@ static void paint_mouse_pointer(AVFormatContext *s1, struct gdigrab *gdigrab)
             pos.y = ci.ptScreenPos.y * desktopvertres / vertres - clip_rect.top - info.yHotspot;
         }
 
+        gdigrab->cur_x = pos.x;
+        gdigrab->cur_y = pos.y;
+
         av_log(s1, AV_LOG_DEBUG, "Cursor pos (%li,%li) -> (%li,%li)\n",
                 ci.ptScreenPos.x, ci.ptScreenPos.y, pos.x, pos.y);
 
@@ -595,6 +755,14 @@ static int gdigrab_read_packet(AVFormatContext *s1, AVPacket *pkt)
     if (gdigrab->draw_mouse)
         paint_mouse_pointer(s1, gdigrab);
 
+    /* Record and print events */
+    if (gdigrab->record_events){
+        free_linked_events(gdigrab->events);
+        gdigrab->events = NULL;
+        record_events(gdigrab);
+        print_recorded_events_json(gdigrab);
+    }
+
     /* Copy bits to packet data */
 
     bfh.bfType = 0x4d42; /* "BM" in little-endian */
@@ -652,6 +820,7 @@ static const AVOption options[] = {
     { "video_size", "set video frame size", OFFSET(width), AV_OPT_TYPE_IMAGE_SIZE, {.str = NULL}, 0, 0, DEC },
     { "offset_x", "capture area x offset", OFFSET(offset_x), AV_OPT_TYPE_INT, {.i64 = 0}, INT_MIN, INT_MAX, DEC },
     { "offset_y", "capture area y offset", OFFSET(offset_y), AV_OPT_TYPE_INT, {.i64 = 0}, INT_MIN, INT_MAX, DEC },
+    { "record_events", "Whether to record events and output them as json to stdout", OFFSET(record_events), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, DEC},
     { NULL },
 };
 
