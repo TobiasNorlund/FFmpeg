@@ -188,18 +188,6 @@ free_linked_events(struct LinkedEvent* head)
 }
 
 /**
- * Gets the last event in a LinkedEvent list
- */
-static LinkedEvent* 
-get_last_event(LinkedEvent* event)
-{
-    if (!event->next)
-        return event;
-    else
-        return get_last_event(event->next);
-}
-
-/**
  * Creates a new event
  */
 static LinkedEvent*
@@ -226,7 +214,6 @@ mouse_hook(int nCode, WPARAM wParam, LPARAM lParam)
         switch (wParam) {
             case WM_LBUTTONDOWN:
                 event = new_linked_event("ButtonPress", 0);
-                printf("ButtonPress\n");
                 break;
             case WM_LBUTTONUP:
                 event = new_linked_event("ButtonRelease", 0);
@@ -243,13 +230,6 @@ mouse_hook(int nCode, WPARAM wParam, LPARAM lParam)
                 break;
         }
         if (event != NULL) {
-            /*if (WaitForSingleObject(ddagrab->mutex, INFINITE) != 0)
-                printf("Error aquired mouse mutex: %d\n", GetCurrentThreadId());
-            else
-                printf("Aquired mouse mutex: %d\n", GetCurrentThreadId());*/
-
-            //Sleep(100);
-            //pthread_mutex_lock(&(ddagrab->mutex));
             WaitForSingleObject(ddagrab->mutex, INFINITE);
             if (ddagrab->first_event == NULL) {
                 ddagrab->first_event = event;
@@ -259,17 +239,6 @@ mouse_hook(int nCode, WPARAM wParam, LPARAM lParam)
                 ddagrab->last_event = event;
             }
             ReleaseMutex(ddagrab->mutex);
-            /*if (ddagrab->events == NULL) {
-                ddagrab->events = event;
-            } else {
-                LinkedEvent* last_event = get_last_event(ddagrab->events);
-                last_event->next = event;
-            }*/
-            //pthread_mutex_unlock(&(ddagrab->mutex));
-            /*if (ReleaseMutex(ddagrab->mutex) != 0) 
-                printf("Error releasing mutex: %d\n", GetCurrentThreadId());
-            else
-                printf("Released mouse mutex: %d\n", GetCurrentThreadId());*/
         }
     }
     return CallNextHookEx(ddagrab->g_hMouseHook, nCode, wParam, lParam);
@@ -309,112 +278,11 @@ keyboard_hook(int nCode, WPARAM wParam, LPARAM lParam)
                 ddagrab->last_event = event;
             }
             ReleaseMutex(ddagrab->mutex);
-            //pthread_mutex_lock(&(ddagrab->mutex));
-            /*if (ddagrab->first_event == NULL) {
-                ddagrab->first_event = event;
-                ddagrab->last_event = event;
-            } else {
-                ddagrab->last_event->next = event;
-                ddagrab->last_event = event;
-            }*/
-            /*if (ddagrab->events == NULL) {
-                ddagrab->events = event;
-            } else {
-                LinkedEvent* last_event = get_last_event(ddagrab->events);
-                last_event->next = event;
-            }*/
-            //pthread_mutex_unlock(&(ddagrab->mutex));
         }
     }
 
     return CallNextHookEx(ddagrab->g_hKeyboardHook, nCode, wParam, lParam);
 }
-
-/*HHOOK g_hMouseHook = NULL;
-HHOOK g_hKeyboardHook = NULL;
-
-static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam)
-{
-    if (nCode == HC_ACTION)
-    {
-        MSLLHOOKSTRUCT* pMouseStruct = (MSLLHOOKSTRUCT*)lParam;
-        switch (wParam)
-        {
-            case WM_MOUSEWHEEL:
-                int delta = GET_WHEEL_DELTA_WPARAM(pMouseStruct->mouseData);
-                printf("Mouse wheel delta: %d\n", delta);
-                break;
-            case WM_LBUTTONDOWN:
-                printf("Left button down\n");
-                break;
-            case WM_LBUTTONUP:
-                printf("Left button up\n");
-                break;
-            case WM_LBUTTONDBLCLK:
-                printf("Left button double click\n");
-                break;
-            // ... other mouse events ...
-        }
-    }
-    return CallNextHookEx(g_hMouseHook, nCode, wParam, lParam);
-}
-
-static LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
-{
-    if (nCode == HC_ACTION)
-    {
-        KBDLLHOOKSTRUCT* pKeyboardStruct = (KBDLLHOOKSTRUCT*)lParam;
-        switch (wParam)
-        {
-            case WM_KEYDOWN:
-            {
-                int* data = (int*)GetMessageExtraInfo();
-                printf("Key down: 0x%X  %d\n", pKeyboardStruct->vkCode, *data);
-                break;
-            }
-            case WM_KEYUP:
-            {
-                printf("Key up: 0x%X\n", pKeyboardStruct->vkCode);
-                break;
-            }
-            // ... other keyboard events ...
-        }
-    }
-
-    return CallNextHookEx(g_hKeyboardHook, nCode, wParam, lParam);
-}
-
-static DWORD WINAPI KeyboardHookThreadProc(LPVOID lpParam)
-{
-    printf("Heeeeeeej\n");
-    g_hMouseHook = SetWindowsHookEx(WH_MOUSE_LL, MouseProc, NULL, 0);
-    if (g_hMouseHook == NULL)
-    {
-        printf("SetWindowsHookEx for mouse hook failed.\n");
-        return 1;
-    }
-    g_hKeyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, KeyboardProc, NULL, 0);
-    if (g_hKeyboardHook == NULL)
-    {
-        printf("SetWindowsHookEx failed.\n");
-        return 1;
-    }
-
-    int data = 1337;
-    SetMessageExtraInfo((LPARAM)&data);
-
-    MSG msg;
-    while (GetMessage(&msg, NULL, 0, 0))
-    {
-        printf("Got message!!\n");
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);    
-    }
-    printf("Exiting message loop...\n");
-    UnhookWindowsHookEx(g_hKeyboardHook);
-
-    return 0;
-}*/
 
 /**
  * Message Loop. Runs in separate thread and populates 
@@ -422,25 +290,21 @@ static DWORD WINAPI KeyboardHookThreadProc(LPVOID lpParam)
 static DWORD WINAPI 
 message_loop(DdagrabContext* ddagrab)
 {
-    
+    MSG msg;
     ddagrab->g_hMouseHook = SetWindowsHookEx(WH_MOUSE_LL, mouse_hook, NULL, 0);
-    if (ddagrab->g_hMouseHook == NULL)
-    {
-        printf("SetWindowsHookEx for mouse hook failed.\n");
+    if (ddagrab->g_hMouseHook == NULL) {
+        fprintf(stderr, "SetWindowsHookEx for mouse hook failed.\n");
         return 1;
     }
     ddagrab->g_hKeyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, keyboard_hook, NULL, 0);
-    if (ddagrab->g_hKeyboardHook == NULL)
-    {
-        printf("SetWindowsHookEx failed.\n");
+    if (ddagrab->g_hKeyboardHook == NULL) {
+        fprintf(stderr, "SetWindowsHookEx failed.\n");
         return 1;
     }
 
     // Use extra info to pass ddagrab object to callbacks
     SetMessageExtraInfo((LPARAM)ddagrab);
-    MSG msg;
-    while (GetMessage(&msg, NULL, 0, 0))
-    {
+    while (GetMessage(&msg, NULL, 0, 0)) {
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }
@@ -476,14 +340,12 @@ static inline void release_resource(void *resource)
 static av_cold void ddagrab_uninit(AVFilterContext *avctx)
 {
     DdagrabContext *dda = avctx->priv;
-    printf("Sending exit message...\n");
+
+    // Close message loop
     PostThreadMessage(GetThreadId(dda->hThread), WM_QUIT, 0, 0);
     WaitForSingleObject(dda->hThread, INFINITE);
     CloseHandle(dda->hThread);
     CloseHandle(dda->mutex);
-    //TerminateThread(dda->hThread, 0);
-    //CloseHandle(dda->hThread);
-    //pthread_mutex_destroy(&(dda->mutex));
 
     release_resource(&dda->blend_state);
     release_resource(&dda->sampler_state);
@@ -763,9 +625,6 @@ static av_cold int init_render_resources(AVFilterContext *avctx)
 
 static av_cold int ddagrab_init(AVFilterContext *avctx)
 {
-    printf("ddagrab_init!!!\n");
-    printf("process id: %ld\n", GetCurrentProcessId());
-    printf("thread id: %ld\n", GetCurrentThreadId());
     DdagrabContext *dda = avctx->priv;
 
     dda->last_frame = av_frame_alloc();
@@ -774,14 +633,9 @@ static av_cold int ddagrab_init(AVFilterContext *avctx)
 
     if (dda->record_events) {
         // Create mutex
-        dda->mutex = CreateMutex( 
-            NULL,              // default security attributes
-            FALSE,             // initially not owned
-            NULL);             // unnamed mutex
-
-        if (dda->mutex == NULL)
-        {
-            printf("CreateMutex error: %d\n", GetLastError());
+        dda->mutex = CreateMutex(NULL, FALSE, NULL);
+        if (dda->mutex == NULL) {
+            fprintf(stderr, "CreateMutex error: %ld\n", GetLastError());
             return 1;
         }
 
@@ -791,12 +645,10 @@ static av_cold int ddagrab_init(AVFilterContext *avctx)
 
         // Setup message loop in separate thread
         dda->hThread = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)message_loop, dda, 0, NULL);
-        //dda->hThread = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)KeyboardHookThreadProc, NULL, 0, NULL);
         if (dda->hThread == NULL) {
-            printf("CreateThread failed.\n");
+            fprintf(stderr, "CreateThread failed.\n");
             return 1;
         }
-        //message_loop(&dda);
     }
 
     dda->mouse_x = -1;
@@ -1271,19 +1123,13 @@ static int ddagrab_request_frame(AVFilterLink *outlink)
     /* Record and print events */
     if (dda->record_events){
         update_cursor_pos(dda);
-        //pthread_mutex_lock(&(dda->mutex));
         if (WaitForSingleObject(dda->mutex, INFINITE) != 0)
-            printf("Error aquired frame mutex: %d\n", GetLastError());
+            fprintf(stderr, "Error aquiring frame mutex: %ld\n", GetLastError());
         print_recorded_events_json(dda);
         free_linked_events(dda->first_event);
         dda->first_event = NULL;
         dda->last_event = NULL;
-        //pthread_mutex_unlock(&(dda->mutex));
         ReleaseMutex(dda->mutex);
-        /*if (ReleaseMutex(dda->mutex) != 0) 
-            printf("Error releasing frame mutex: %d\n", GetLastError());
-        else
-            printf("Released frame mutex\n");*/
     }
 
     /* time_frame is in units of microseconds divided by the time_base.
