@@ -114,12 +114,14 @@ typedef struct DdagrabContext {
     int        force_fmt;
 
     // Record stuff
-    int record_events;
+    char* record_events;
+    FILE* events_file;
     HANDLE hThread;
     int cur_x, cur_y;
     HHOOK g_hMouseHook;
     HHOOK g_hKeyboardHook;
     HANDLE mutex;
+    int in_message_loop;
     LinkedEvent* first_event;
     LinkedEvent* last_event;
 } DdagrabContext;
@@ -129,7 +131,7 @@ typedef struct DdagrabContext {
 static const AVOption ddagrab_options[] = {
     { "output_idx", "dda output index to capture", OFFSET(output_idx), AV_OPT_TYPE_INT,        { .i64 = 0    },       0, INT_MAX, FLAGS },
     { "draw_mouse", "draw the mouse pointer",      OFFSET(draw_mouse), AV_OPT_TYPE_BOOL,       { .i64 = 1    },       0,       1, FLAGS },
-    { "record_events", "record events and output them as json to stdout", OFFSET(record_events), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, FLAGS},
+    { "record_events", "record events and output them as json to stdout", OFFSET(record_events), AV_OPT_TYPE_STRING, { .str = 0 }, 0, 0, FLAGS},
     { "framerate",  "set video frame rate",        OFFSET(framerate),  AV_OPT_TYPE_VIDEO_RATE, { .str = "30" },       0, INT_MAX, FLAGS },
     { "video_size", "set video frame size",        OFFSET(width),      AV_OPT_TYPE_IMAGE_SIZE, { .str = NULL },       0,       0, FLAGS },
     { "offset_x",   "capture area x offset",       OFFSET(offset_x),   AV_OPT_TYPE_INT,        { .i64 = 0    }, INT_MIN, INT_MAX, FLAGS },
@@ -158,18 +160,18 @@ static void
 print_recorded_events_json(DdagrabContext* c)
 {
     LinkedEvent* ev;
-    printf("{\"cur_x\":%d,\"cur_y\":%d", c->cur_x, c->cur_y);
+    fprintf(c->events_file, "{\"cur_x\":%d,\"cur_y\":%d", c->cur_x, c->cur_y);
     if (c->first_event){
-        printf(",\"events\":[");
+        fprintf(c->events_file, ",\"events\":[");
         ev = c->first_event;
         while(ev) {
-            printf("{\"type\":\"%s\",\"code\":%d}", ev->type, ev->code);
+            fprintf(c->events_file, "{\"type\":\"%s\",\"code\":%d}", ev->type, ev->code);
             ev = ev->next;
-            if (ev) printf(",");
+            if (ev) fprintf(c->events_file, ",");
         }
-        printf("]");
+        fprintf(c->events_file, "]");
     }
-    printf("}\n");
+    fprintf(c->events_file, "}\n");
 }
 
 /**
@@ -304,6 +306,10 @@ message_loop(DdagrabContext* ddagrab)
 
     // Use extra info to pass ddagrab object to callbacks
     SetMessageExtraInfo((LPARAM)ddagrab);
+
+    // Hack to prevent race condition if ddagrab_uninit is faster to send exit message
+    ddagrab->in_message_loop = 1;
+    //printf("Entering message loop\n");
     while (GetMessage(&msg, NULL, 0, 0)) {
         TranslateMessage(&msg);
         DispatchMessage(&msg);
@@ -311,6 +317,7 @@ message_loop(DdagrabContext* ddagrab)
 
     UnhookWindowsHookEx(ddagrab->g_hMouseHook);
     UnhookWindowsHookEx(ddagrab->g_hKeyboardHook);
+
     return 0;
 }
 
@@ -341,8 +348,20 @@ static av_cold void ddagrab_uninit(AVFilterContext *avctx)
 {
     DdagrabContext *dda = avctx->priv;
 
+    // Close output file
+    if (dda->events_file != NULL){
+        fclose(dda->events_file);
+    }
+
+    // Wait until thread is listening for messages
+    //printf("Waiting for in_message_loop...\n");
+    while(!dda->in_message_loop){
+        Sleep(100);
+    }
+
     // Close message loop
     PostThreadMessage(GetThreadId(dda->hThread), WM_QUIT, 0, 0);
+    //printf("Waiting for thread to finish...\n");
     WaitForSingleObject(dda->hThread, INFINITE);
     CloseHandle(dda->hThread);
     CloseHandle(dda->mutex);
@@ -631,7 +650,15 @@ static av_cold int ddagrab_init(AVFilterContext *avctx)
     if (!dda->last_frame)
         return AVERROR(ENOMEM);
 
-    if (dda->record_events) {
+
+    if (strcmp(dda->record_events, "") != 0) {
+        // Open file handle
+        dda->events_file = fopen(dda->record_events, "w");
+        if (dda->events_file == NULL) {
+            fprintf(stderr, "Open events file error: %ld\n", GetLastError());
+            return 1;
+        }
+
         // Create mutex
         dda->mutex = CreateMutex(NULL, FALSE, NULL);
         if (dda->mutex == NULL) {
@@ -644,6 +671,7 @@ static av_cold int ddagrab_init(AVFilterContext *avctx)
         dda->last_event = NULL;
 
         // Setup message loop in separate thread
+        dda->in_message_loop = 0;
         dda->hThread = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)message_loop, dda, 0, NULL);
         if (dda->hThread == NULL) {
             fprintf(stderr, "CreateThread failed.\n");
