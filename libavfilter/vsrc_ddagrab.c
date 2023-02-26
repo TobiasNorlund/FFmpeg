@@ -131,7 +131,7 @@ typedef struct DdagrabContext {
 static const AVOption ddagrab_options[] = {
     { "output_idx", "dda output index to capture", OFFSET(output_idx), AV_OPT_TYPE_INT,        { .i64 = 0    },       0, INT_MAX, FLAGS },
     { "draw_mouse", "draw the mouse pointer",      OFFSET(draw_mouse), AV_OPT_TYPE_BOOL,       { .i64 = 1    },       0,       1, FLAGS },
-    { "record_events", "record events and output them as json to stdout", OFFSET(record_events), AV_OPT_TYPE_STRING, { .str = 0 }, 0, 0, FLAGS},
+    { "record_events", "record events and output them as json", OFFSET(record_events), AV_OPT_TYPE_STRING, { .str = "" }, 0, 0, FLAGS},
     { "framerate",  "set video frame rate",        OFFSET(framerate),  AV_OPT_TYPE_VIDEO_RATE, { .str = "30" },       0, INT_MAX, FLAGS },
     { "video_size", "set video frame size",        OFFSET(width),      AV_OPT_TYPE_IMAGE_SIZE, { .str = NULL },       0,       0, FLAGS },
     { "offset_x",   "capture area x offset",       OFFSET(offset_x),   AV_OPT_TYPE_INT,        { .i64 = 0    }, INT_MIN, INT_MAX, FLAGS },
@@ -353,18 +353,20 @@ static av_cold void ddagrab_uninit(AVFilterContext *avctx)
         fclose(dda->events_file);
     }
 
-    // Wait until thread is listening for messages
-    //printf("Waiting for in_message_loop...\n");
-    while(!dda->in_message_loop){
-        Sleep(100);
-    }
+    if (strcmp(dda->record_events, "") != 0) {
+        // Wait until thread is listening for messages
+        //printf("Waiting for in_message_loop...\n");
+        while(!dda->in_message_loop){
+            Sleep(100);
+        }
 
-    // Close message loop
-    PostThreadMessage(GetThreadId(dda->hThread), WM_QUIT, 0, 0);
-    //printf("Waiting for thread to finish...\n");
-    WaitForSingleObject(dda->hThread, INFINITE);
-    CloseHandle(dda->hThread);
-    CloseHandle(dda->mutex);
+        // Close message loop
+        PostThreadMessage(GetThreadId(dda->hThread), WM_QUIT, 0, 0);
+        //printf("Waiting for thread to finish...\n");
+        WaitForSingleObject(dda->hThread, INFINITE);
+        CloseHandle(dda->hThread);
+        CloseHandle(dda->mutex);
+    }
 
     release_resource(&dda->blend_state);
     release_resource(&dda->sampler_state);
@@ -1041,8 +1043,9 @@ static int draw_mouse_pointer(AVFilterContext *avctx, AVFrame *frame)
     HRESULT hr;
     int ret = 0;
 
-    if (!dda->mouse_texture || dda->mouse_x < 0 || dda->mouse_y < 0)
+    if (!dda->mouse_texture || dda->mouse_x < 0 || dda->mouse_y < 0) {
         return 0;
+    }
 
     ID3D11Texture2D_GetDesc(dda->mouse_texture, &tex_desc);
 
@@ -1050,8 +1053,9 @@ static int draw_mouse_pointer(AVFilterContext *avctx, AVFrame *frame)
     y = dda->mouse_y - dda->offset_y;
 
     if (x >= dda->width || y >= dda->height ||
-        -x >= (int)tex_desc.Width || -y >= (int)tex_desc.Height)
+        -x >= (int)tex_desc.Width || -y >= (int)tex_desc.Height) {
         return 0;
+    }
 
     target_desc.Format = dda->raw_format;
     target_desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
@@ -1078,7 +1082,7 @@ static int draw_mouse_pointer(AVFilterContext *avctx, AVFrame *frame)
 
         ID3D11DeviceContext_RSSetViewports(devctx, 1, &viewport);
     }
-
+    
     {
         FLOAT vertices[] = {
             // x, y, z,  u, v
@@ -1149,7 +1153,7 @@ static int ddagrab_request_frame(AVFilterLink *outlink)
     int ret;
 
     /* Record and print events */
-    if (dda->record_events){
+    if (strcmp(dda->record_events, "") != 0) {
         update_cursor_pos(dda);
         if (WaitForSingleObject(dda->mutex, INFINITE) != 0)
             fprintf(stderr, "Error aquiring frame mutex: %ld\n", GetLastError());
