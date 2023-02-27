@@ -735,16 +735,16 @@ static void paint_mouse_pointer(AVFormatContext *s1, struct gdigrab *gdigrab)
             pos.y = ci.ptScreenPos.y * desktopvertres / vertres - clip_rect.top - info.yHotspot;
         }
 
-        gdigrab->cur_x = pos.x;
-        gdigrab->cur_y = pos.y;
-
         av_log(s1, AV_LOG_DEBUG, "Cursor pos (%li,%li) -> (%li,%li)\n",
                 ci.ptScreenPos.x, ci.ptScreenPos.y, pos.x, pos.y);
 
-        if (pos.x >= 0 && pos.x <= clip_rect.right - clip_rect.left &&
-                pos.y >= 0 && pos.y <= clip_rect.bottom - clip_rect.top) {
-            if (!DrawIcon(gdigrab->dest_hdc, pos.x, pos.y, icon))
-                CURSOR_ERROR("Couldn't draw icon");
+        if (!DrawIcon(gdigrab->dest_hdc, pos.x, pos.y, icon)){
+            CURSOR_ERROR("Couldn't draw icon");
+            gdigrab->cur_x = -1;
+            gdigrab->cur_y = -1;
+        }else{
+            gdigrab->cur_x = ci.ptScreenPos.x;
+            gdigrab->cur_y = ci.ptScreenPos.y;
         }
 
 icon_error:
