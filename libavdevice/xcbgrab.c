@@ -387,10 +387,6 @@ static void xcbgrab_draw_mouse(AVFormatContext *s, AVPacket *pkt,
     if (!ci)
         return;
 
-    cursor = xcb_xfixes_get_cursor_image_cursor_image(ci);
-    if (!cursor)
-        return;
-
     cx = ci->x - ci->xhot;
     cy = ci->y - ci->yhot;
 
@@ -400,6 +396,13 @@ static void xcbgrab_draw_mouse(AVFormatContext *s, AVPacket *pkt,
     // Save cursor position for recording
     gr->cur_x = x;
     gr->cur_y = y;
+
+    if (!gr->draw_mouse)
+        return;
+
+    cursor = xcb_xfixes_get_cursor_image_cursor_image(ci);
+    if (!cursor)
+        return;
 
     w = FFMIN(cx + ci->width,  win_x + gr->x + gr->width)  - x;
     h = FFMIN(cy + ci->height, win_y + gr->y + gr->height) - y;
@@ -478,21 +481,21 @@ static int xcbgrab_read_packet(AVFormatContext *s, AVPacket *pkt)
         XRecordProcessReplies (c->data_disp);
     }
 
-    if (c->follow_mouse || c->draw_mouse) {
-        pc  = xcb_query_pointer(c->conn, c->window_id);
-        gc  = xcb_get_geometry(c->conn, c->window_id);
-        p   = xcb_query_pointer_reply(c->conn, pc, NULL);
-        if (!p) {
-            av_log(s, AV_LOG_ERROR, "Failed to query xcb pointer\n");
-            return AVERROR_EXTERNAL;
-        }
-        geo = xcb_get_geometry_reply(c->conn, gc, NULL);
-        if (!geo) {
-            av_log(s, AV_LOG_ERROR, "Failed to get xcb geometry\n");
-            free(p);
-            return AVERROR_EXTERNAL;
-        }
+    //if (c->follow_mouse || c->draw_mouse) {
+    pc  = xcb_query_pointer(c->conn, c->window_id);
+    gc  = xcb_get_geometry(c->conn, c->window_id);
+    p   = xcb_query_pointer_reply(c->conn, pc, NULL);
+    if (!p) {
+        av_log(s, AV_LOG_ERROR, "Failed to query xcb pointer\n");
+        return AVERROR_EXTERNAL;
     }
+    geo = xcb_get_geometry_reply(c->conn, gc, NULL);
+    if (!geo) {
+        av_log(s, AV_LOG_ERROR, "Failed to get xcb geometry\n");
+        free(p);
+        return AVERROR_EXTERNAL;
+    }
+    //}
     if (c->window_id != c->screen->root) {
         tc = xcb_translate_coordinates(c->conn, c->window_id, c->screen->root, 0, 0);
         translate = xcb_translate_coordinates_reply(c->conn, tc, NULL);
@@ -525,8 +528,9 @@ static int xcbgrab_read_packet(AVFormatContext *s, AVPacket *pkt)
     pkt->duration = c->frame_duration;
 
 #if CONFIG_LIBXCB_XFIXES
-    if (ret >= 0 && c->draw_mouse && p->same_screen)
+    if (ret >= 0 && p->same_screen){
         xcbgrab_draw_mouse(s, pkt, p, geo, win_x, win_y);
+    }
 #endif
 
     // Output any events
@@ -988,17 +992,19 @@ static av_cold int xcbgrab_read_header(AVFormatContext *s)
 #endif
 
 #if CONFIG_LIBXCB_XFIXES
-    if (c->draw_mouse) {
-        if (!(c->draw_mouse = check_xfixes(c->conn))) {
-            av_log(s, AV_LOG_WARNING,
-                   "XFixes not available, cannot draw the mouse.\n");
-        }
-        if (c->bpp < 24) {
-            avpriv_report_missing_feature(s, "%d bits per pixel screen",
-                                          c->bpp);
-            c->draw_mouse = 0;
-        }
+    //if (c->draw_mouse) {
+    if (!(ret = check_xfixes(c->conn))) {
+        av_log(s, AV_LOG_WARNING,
+                "XFixes not available, cannot draw the mouse.\n");
+        if (c->draw_mouse)
+            c->draw_mouse = ret;
     }
+    if (c->bpp < 24) {
+        avpriv_report_missing_feature(s, "%d bits per pixel screen",
+                                        c->bpp);
+        c->draw_mouse = 0;
+    }
+    //}
 #endif
 
     if (c->show_region)
