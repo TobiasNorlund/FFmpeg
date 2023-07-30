@@ -25,6 +25,7 @@
 #define WIN32_LEAN_AND_MEAN
 
 #include <windows.h>
+#include <processthreadsapi.h>
 
 #define COBJMACROS
 
@@ -48,10 +49,21 @@
 #include "video.h"
 
 #include "vsrc_ddagrab_shaders.h"
+#include <pthread.h>
 
 // avutil/time.h takes and returns time in microseconds
 #define TIMER_RES 1000000
 #define TIMER_RES64 INT64_C(1000000)
+
+/** 
+ * Linked list for events
+ */
+typedef struct LinkedEvent {
+    char type[14];
+    int code;
+    struct LinkedEvent* next;
+} LinkedEvent;
+
 
 typedef struct DdagrabContext {
     const AVClass *class;
@@ -100,6 +112,18 @@ typedef struct DdagrabContext {
     int        out_fmt;
     int        allow_fallback;
     int        force_fmt;
+
+    // Record stuff
+    char* record_events;
+    FILE* events_file;
+    HANDLE hThread;
+    int cur_x, cur_y;
+    HHOOK g_hMouseHook;
+    HHOOK g_hKeyboardHook;
+    HANDLE mutex;
+    int in_message_loop;
+    LinkedEvent* first_event;
+    LinkedEvent* last_event;
 } DdagrabContext;
 
 #define OFFSET(x) offsetof(DdagrabContext, x)
@@ -107,6 +131,7 @@ typedef struct DdagrabContext {
 static const AVOption ddagrab_options[] = {
     { "output_idx", "dda output index to capture", OFFSET(output_idx), AV_OPT_TYPE_INT,        { .i64 = 0    },       0, INT_MAX, FLAGS },
     { "draw_mouse", "draw the mouse pointer",      OFFSET(draw_mouse), AV_OPT_TYPE_BOOL,       { .i64 = 1    },       0,       1, FLAGS },
+    { "record_events", "record events and output them as json", OFFSET(record_events), AV_OPT_TYPE_STRING, { .str = "" }, 0, 0, FLAGS},
     { "framerate",  "set video frame rate",        OFFSET(framerate),  AV_OPT_TYPE_VIDEO_RATE, { .str = "30" },       0, INT_MAX, FLAGS },
     { "video_size", "set video frame size",        OFFSET(width),      AV_OPT_TYPE_IMAGE_SIZE, { .str = NULL },       0,       0, FLAGS },
     { "offset_x",   "capture area x offset",       OFFSET(offset_x),   AV_OPT_TYPE_INT,        { .i64 = 0    }, INT_MIN, INT_MAX, FLAGS },
@@ -128,6 +153,188 @@ static const AVOption ddagrab_options[] = {
 
 AVFILTER_DEFINE_CLASS(ddagrab);
 
+/**
+ * Print events as json line
+ */
+static void
+print_recorded_events_json(DdagrabContext* c)
+{
+    LinkedEvent* ev;
+    fprintf(c->events_file, "{\"cur_x\":%d,\"cur_y\":%d", c->cur_x, c->cur_y);
+    if (c->first_event){
+        fprintf(c->events_file, ",\"events\":[");
+        ev = c->first_event;
+        while(ev) {
+            fprintf(c->events_file, "{\"type\":\"%s\",\"code\":%d}", ev->type, ev->code);
+            ev = ev->next;
+            if (ev) fprintf(c->events_file, ",");
+        }
+        fprintf(c->events_file, "]");
+    }
+    fprintf(c->events_file, "}\n");
+}
+
+/**
+ * Free events memory
+*/
+static void
+free_linked_events(struct LinkedEvent* head)
+{
+   struct LinkedEvent* tmp;
+   while (head != NULL)
+   {
+       tmp = head;
+       head = head->next;
+       free(tmp);
+   }
+}
+
+/**
+ * Creates a new event
+ */
+static LinkedEvent*
+new_linked_event(const char type[], int code)
+{
+    LinkedEvent* event = (LinkedEvent *) malloc(sizeof(LinkedEvent));
+    strcpy(event->type, type);
+    event->code = code;
+    event->next = NULL;
+    return event;
+}
+
+/**
+ * Callback for mouse messages
+*/
+static LRESULT CALLBACK 
+mouse_hook(int nCode, WPARAM wParam, LPARAM lParam)
+{
+    DdagrabContext* ddagrab = (DdagrabContext*)GetMessageExtraInfo();
+    LinkedEvent* event = NULL;
+    if (nCode == HC_ACTION)
+    {
+        MSLLHOOKSTRUCT* pMouseStruct = (MSLLHOOKSTRUCT*)lParam;
+        switch (wParam) {
+            case WM_LBUTTONDOWN:
+                event = new_linked_event("ButtonPress", 0);
+                break;
+            case WM_LBUTTONUP:
+                event = new_linked_event("ButtonRelease", 0);
+                break;
+            case WM_RBUTTONDOWN:
+                event = new_linked_event("ButtonPress", 1);
+                break;
+            case WM_RBUTTONUP:
+                event = new_linked_event("ButtonRelease", 1);
+                break;
+            case WM_MOUSEWHEEL:
+                int delta = GET_WHEEL_DELTA_WPARAM(pMouseStruct->mouseData);
+                event = new_linked_event("MouseScroll", delta);
+                break;
+        }
+        if (event != NULL) {
+            WaitForSingleObject(ddagrab->mutex, INFINITE);
+            if (ddagrab->first_event == NULL) {
+                ddagrab->first_event = event;
+                ddagrab->last_event = event;
+            } else {
+                ddagrab->last_event->next = event;
+                ddagrab->last_event = event;
+            }
+            ReleaseMutex(ddagrab->mutex);
+        }
+    }
+    return CallNextHookEx(ddagrab->g_hMouseHook, nCode, wParam, lParam);
+}
+
+/**
+ * Callback for keyboard messages
+*/
+static LRESULT CALLBACK 
+keyboard_hook(int nCode, WPARAM wParam, LPARAM lParam)
+{
+    DdagrabContext* ddagrab = (DdagrabContext*)GetMessageExtraInfo();
+    LinkedEvent* event = NULL;
+    if (nCode == HC_ACTION)
+    {
+        KBDLLHOOKSTRUCT* pKeyboardStruct = (KBDLLHOOKSTRUCT*)lParam;
+        switch (wParam)
+        {
+            case WM_KEYDOWN:
+            {
+                event = new_linked_event("KeyPress", pKeyboardStruct->vkCode);
+                break;
+            }
+            case WM_KEYUP:
+            {
+                event = new_linked_event("KeyRelease", pKeyboardStruct->vkCode);
+                break;
+            }
+        }
+        if (event != NULL) {
+            WaitForSingleObject(ddagrab->mutex, INFINITE);
+            if (ddagrab->first_event == NULL) {
+                ddagrab->first_event = event;
+                ddagrab->last_event = event;
+            } else {
+                ddagrab->last_event->next = event;
+                ddagrab->last_event = event;
+            }
+            ReleaseMutex(ddagrab->mutex);
+        }
+    }
+
+    return CallNextHookEx(ddagrab->g_hKeyboardHook, nCode, wParam, lParam);
+}
+
+/**
+ * Message Loop. Runs in separate thread and populates 
+*/
+static DWORD WINAPI 
+message_loop(DdagrabContext* ddagrab)
+{
+    MSG msg;
+    ddagrab->g_hMouseHook = SetWindowsHookEx(WH_MOUSE_LL, mouse_hook, NULL, 0);
+    if (ddagrab->g_hMouseHook == NULL) {
+        fprintf(stderr, "SetWindowsHookEx for mouse hook failed.\n");
+        return 1;
+    }
+    ddagrab->g_hKeyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, keyboard_hook, NULL, 0);
+    if (ddagrab->g_hKeyboardHook == NULL) {
+        fprintf(stderr, "SetWindowsHookEx failed.\n");
+        return 1;
+    }
+
+    // Use extra info to pass ddagrab object to callbacks
+    SetMessageExtraInfo((LPARAM)ddagrab);
+
+    // Hack to prevent race condition if ddagrab_uninit is faster to send exit message
+    ddagrab->in_message_loop = 1;
+    //printf("Entering message loop\n");
+    while (GetMessage(&msg, NULL, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+
+    UnhookWindowsHookEx(ddagrab->g_hMouseHook);
+    UnhookWindowsHookEx(ddagrab->g_hKeyboardHook);
+
+    return 0;
+}
+
+static void update_cursor_pos(DdagrabContext* dda){
+    CURSORINFO ci = {0};
+    ci.cbSize = sizeof(ci);
+    if (GetCursorInfo(&ci)) {
+        if (ci.flags != CURSOR_SHOWING) {
+            dda->cur_x = -1;
+            dda->cur_y = -1;
+        } else {
+            dda->cur_x = ci.ptScreenPos.x;
+            dda->cur_y = ci.ptScreenPos.y;
+        }
+    }
+}
+
 static inline void release_resource(void *resource)
 {
     IUnknown **resp = (IUnknown**)resource;
@@ -140,6 +347,26 @@ static inline void release_resource(void *resource)
 static av_cold void ddagrab_uninit(AVFilterContext *avctx)
 {
     DdagrabContext *dda = avctx->priv;
+
+    // Close output file
+    if (dda->events_file != NULL){
+        fclose(dda->events_file);
+    }
+
+    if (strcmp(dda->record_events, "") != 0) {
+        // Wait until thread is listening for messages
+        //printf("Waiting for in_message_loop...\n");
+        while(!dda->in_message_loop){
+            Sleep(100);
+        }
+
+        // Close message loop
+        PostThreadMessage(GetThreadId(dda->hThread), WM_QUIT, 0, 0);
+        //printf("Waiting for thread to finish...\n");
+        WaitForSingleObject(dda->hThread, INFINITE);
+        CloseHandle(dda->hThread);
+        CloseHandle(dda->mutex);
+    }
 
     release_resource(&dda->blend_state);
     release_resource(&dda->sampler_state);
@@ -425,9 +652,38 @@ static av_cold int ddagrab_init(AVFilterContext *avctx)
     if (!dda->last_frame)
         return AVERROR(ENOMEM);
 
+
+    if (strcmp(dda->record_events, "") != 0) {
+        // Open file handle
+        dda->events_file = fopen(dda->record_events, "w");
+        if (dda->events_file == NULL) {
+            fprintf(stderr, "Open events file error: %ld\n", GetLastError());
+            return 1;
+        }
+
+        // Create mutex
+        dda->mutex = CreateMutex(NULL, FALSE, NULL);
+        if (dda->mutex == NULL) {
+            fprintf(stderr, "CreateMutex error: %ld\n", GetLastError());
+            return 1;
+        }
+
+        // Init events list
+        dda->first_event = NULL;
+        dda->last_event = NULL;
+
+        // Setup message loop in separate thread
+        dda->in_message_loop = 0;
+        dda->hThread = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)message_loop, dda, 0, NULL);
+        if (dda->hThread == NULL) {
+            fprintf(stderr, "CreateThread failed.\n");
+            return 1;
+        }
+    }
+
     dda->mouse_x = -1;
     dda->mouse_y = -1;
-
+    
     return 0;
 }
 
@@ -787,8 +1043,9 @@ static int draw_mouse_pointer(AVFilterContext *avctx, AVFrame *frame)
     HRESULT hr;
     int ret = 0;
 
-    if (!dda->mouse_texture || dda->mouse_x < 0 || dda->mouse_y < 0)
+    if (!dda->mouse_texture || dda->mouse_x < 0 || dda->mouse_y < 0) {
         return 0;
+    }
 
     ID3D11Texture2D_GetDesc(dda->mouse_texture, &tex_desc);
 
@@ -796,8 +1053,9 @@ static int draw_mouse_pointer(AVFilterContext *avctx, AVFrame *frame)
     y = dda->mouse_y - dda->offset_y;
 
     if (x >= dda->width || y >= dda->height ||
-        -x >= (int)tex_desc.Width || -y >= (int)tex_desc.Height)
+        -x >= (int)tex_desc.Width || -y >= (int)tex_desc.Height) {
         return 0;
+    }
 
     target_desc.Format = dda->raw_format;
     target_desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
@@ -824,7 +1082,7 @@ static int draw_mouse_pointer(AVFilterContext *avctx, AVFrame *frame)
 
         ID3D11DeviceContext_RSSetViewports(devctx, 1, &viewport);
     }
-
+    
     {
         FLOAT vertices[] = {
             // x, y, z,  u, v
@@ -893,6 +1151,18 @@ static int ddagrab_request_frame(AVFilterLink *outlink)
     AVFrame *frame = NULL;
     HRESULT hr;
     int ret;
+
+    /* Record and print events */
+    if (strcmp(dda->record_events, "") != 0) {
+        update_cursor_pos(dda);
+        if (WaitForSingleObject(dda->mutex, INFINITE) != 0)
+            fprintf(stderr, "Error aquiring frame mutex: %ld\n", GetLastError());
+        print_recorded_events_json(dda);
+        free_linked_events(dda->first_event);
+        dda->first_event = NULL;
+        dda->last_event = NULL;
+        ReleaseMutex(dda->mutex);
+    }
 
     /* time_frame is in units of microseconds divided by the time_base.
      * This means that adding a clean 1M to it is the equivalent of adding

@@ -78,13 +78,16 @@ struct gdigrab {
     int cursor_error_printed;
 
     // Record stuff
-    int record_events;
-    int cur_x, cur_y;
+    char* record_events;
+    FILE* events_file;
     HANDLE hThread;
+    int cur_x, cur_y;
     HHOOK g_hMouseHook;
     HHOOK g_hKeyboardHook;
-    pthread_mutex_t mutex;
-    LinkedEvent* events;
+    HANDLE mutex;
+    int in_message_loop;
+    LinkedEvent* first_event;
+    LinkedEvent* last_event;
 };
 
 
@@ -100,18 +103,18 @@ static void
 print_recorded_events_json(struct gdigrab* c)
 {
     LinkedEvent* ev;
-    printf("{\"cur_x\":%d,\"cur_y\":%d", c->cur_x, c->cur_y);
-    if (c->events){
-        printf(",\"events\":[");
-        ev = c->events;
+    fprintf(c->events_file, "{\"cur_x\":%d,\"cur_y\":%d", c->cur_x, c->cur_y);
+    if (c->first_event){
+        fprintf(c->events_file, ",\"events\":[");
+        ev = c->first_event;
         while(ev) {
-            printf("{\"type\":\"%s\",\"code\":%d}", ev->type, ev->code);
+            fprintf(c->events_file, "{\"type\":\"%s\",\"code\":%d}", ev->type, ev->code);
             ev = ev->next;
-            if (ev) printf(",");
+            if (ev) fprintf(c->events_file, ",");
         }
-        printf("]");
+        fprintf(c->events_file, "]");
     }
-    printf("}\n");
+    fprintf(c->events_file, "}\n");
 }
 
 /**
@@ -127,18 +130,6 @@ free_linked_events(struct LinkedEvent* head)
        head = head->next;
        free(tmp);
    }
-}
-
-/**
- * Gets the last event in a LinkedEvent list
- */
-static LinkedEvent* 
-get_last_event(LinkedEvent* event)
-{
-    if (!event->next)
-        return event;
-    else
-        return get_last_event(event->next);
 }
 
 /**
@@ -165,8 +156,7 @@ mouse_hook(int nCode, WPARAM wParam, LPARAM lParam)
     if (nCode == HC_ACTION)
     {
         MSLLHOOKSTRUCT* pMouseStruct = (MSLLHOOKSTRUCT*)lParam;
-        switch (wParam)
-        {
+        switch (wParam) {
             case WM_LBUTTONDOWN:
                 event = new_linked_event("ButtonPress", 0);
                 break;
@@ -185,14 +175,15 @@ mouse_hook(int nCode, WPARAM wParam, LPARAM lParam)
                 break;
         }
         if (event != NULL) {
-            pthread_mutex_lock(&(gdigrab->mutex));
-            if (gdigrab->events == NULL) {
-                gdigrab->events = event;
+            WaitForSingleObject(gdigrab->mutex, INFINITE);
+            if (gdigrab->first_event == NULL) {
+                gdigrab->first_event = event;
+                gdigrab->last_event = event;
             } else {
-                LinkedEvent* last_event = get_last_event(gdigrab->events);
-                last_event->next = event;
+                gdigrab->last_event->next = event;
+                gdigrab->last_event = event;
             }
-            pthread_mutex_unlock(&(gdigrab->mutex));
+            ReleaseMutex(gdigrab->mutex);
         }
     }
     return CallNextHookEx(gdigrab->g_hMouseHook, nCode, wParam, lParam);
@@ -223,14 +214,15 @@ keyboard_hook(int nCode, WPARAM wParam, LPARAM lParam)
             }
         }
         if (event != NULL) {
-            pthread_mutex_lock(&(gdigrab->mutex));
-            if (gdigrab->events == NULL) {
-                gdigrab->events = event;
+            WaitForSingleObject(gdigrab->mutex, INFINITE);
+            if (gdigrab->first_event == NULL) {
+                gdigrab->first_event = event;
+                gdigrab->last_event = event;
             } else {
-                LinkedEvent* last_event = get_last_event(gdigrab->events);
-                last_event->next = event;
+                gdigrab->last_event->next = event;
+                gdigrab->last_event = event;
             }
-            pthread_mutex_unlock(&(gdigrab->mutex));
+            ReleaseMutex(gdigrab->mutex);
         }
     }
 
@@ -259,7 +251,8 @@ message_loop(struct gdigrab* gdigrab)
 
     // Use extra info to pass gdigrab object to callbacks
     SetMessageExtraInfo((LPARAM)gdigrab);
-
+    // Hack to prevent race condition if ddagrab_uninit is faster to send exit message
+    gdigrab->in_message_loop = 1;
     while (GetMessage(&msg, NULL, 0, 0))
     {
         TranslateMessage(&msg);
@@ -625,24 +618,32 @@ gdigrab_read_header(AVFormatContext *s1)
             goto error;
         }
     }
-
-    if (gdigrab->record_events) {
-        // Create mutex
-        if (pthread_mutex_init(&gdigrab->mutex, NULL) != 0)
-        {
-            printf("\n mutex init failed\n");
+    if (strcmp(gdigrab->record_events, "") != 0) {
+        // Open file handle
+        gdigrab->events_file = fopen(gdigrab->record_events, "w");
+        if (gdigrab->events_file == NULL) {
+            fprintf(stderr, "Open events file error: %ld\n", GetLastError());
             return 1;
         }
 
-        // Setup message loop in separate thread
-        gdigrab->hThread = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)message_loop, gdigrab, 0, NULL);
-        if (gdigrab->hThread == NULL) {
-            printf("CreateThread failed.\n");
+        // Create mutex
+        gdigrab->mutex = CreateMutex(NULL, FALSE, NULL);
+        if (gdigrab->mutex == NULL) {
+            fprintf(stderr, "CreateMutex error: %ld\n", GetLastError());
             return 1;
         }
 
         // Init events list
-        gdigrab->events = NULL;
+        gdigrab->first_event = NULL;
+        gdigrab->last_event = NULL;
+
+        // Setup message loop in separate thread
+        gdigrab->in_message_loop = 0;
+        gdigrab->hThread = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)message_loop, gdigrab, 0, NULL);
+        if (gdigrab->hThread == NULL) {
+            fprintf(stderr, "CreateThread failed.\n");
+            return 1;
+        }
     }
     
     st->avg_frame_rate = av_inv_q(gdigrab->time_base);
@@ -734,16 +735,16 @@ static void paint_mouse_pointer(AVFormatContext *s1, struct gdigrab *gdigrab)
             pos.y = ci.ptScreenPos.y * desktopvertres / vertres - clip_rect.top - info.yHotspot;
         }
 
-        gdigrab->cur_x = pos.x;
-        gdigrab->cur_y = pos.y;
-
         av_log(s1, AV_LOG_DEBUG, "Cursor pos (%li,%li) -> (%li,%li)\n",
                 ci.ptScreenPos.x, ci.ptScreenPos.y, pos.x, pos.y);
 
-        if (pos.x >= 0 && pos.x <= clip_rect.right - clip_rect.left &&
-                pos.y >= 0 && pos.y <= clip_rect.bottom - clip_rect.top) {
-            if (!DrawIcon(gdigrab->dest_hdc, pos.x, pos.y, icon))
-                CURSOR_ERROR("Couldn't draw icon");
+        if (!DrawIcon(gdigrab->dest_hdc, pos.x, pos.y, icon)){
+            CURSOR_ERROR("Couldn't draw icon");
+            gdigrab->cur_x = -1;
+            gdigrab->cur_y = -1;
+        }else{
+            gdigrab->cur_x = ci.ptScreenPos.x;
+            gdigrab->cur_y = ci.ptScreenPos.y;
         }
 
 icon_error:
@@ -821,12 +822,14 @@ static int gdigrab_read_packet(AVFormatContext *s1, AVPacket *pkt)
         paint_mouse_pointer(s1, gdigrab);
 
     /* Record and print events */
-    if (gdigrab->record_events){
-        pthread_mutex_lock(&(gdigrab->mutex));
+    if (strcmp(gdigrab->record_events, "") != 0) {
+        if (WaitForSingleObject(gdigrab->mutex, INFINITE) != 0)
+            fprintf(stderr, "Error aquiring frame mutex: %ld\n", GetLastError());
         print_recorded_events_json(gdigrab);
-        free_linked_events(gdigrab->events);
-        gdigrab->events = NULL;
-        pthread_mutex_unlock(&(gdigrab->mutex));
+        free_linked_events(gdigrab->first_event);
+        gdigrab->first_event = NULL;
+        gdigrab->last_event = NULL;
+        ReleaseMutex(gdigrab->mutex);
     }
 
     /* Copy bits to packet data */
@@ -874,6 +877,26 @@ static int gdigrab_read_close(AVFormatContext *s1)
     if (s->source_hdc)
         DeleteDC(s->source_hdc);
 
+    // Close output file
+    if (s->events_file != NULL){
+        fclose(s->events_file);
+    }
+
+    if (strcmp(s->record_events, "") != 0) {
+        // Wait until thread is listening for messages
+        //printf("Waiting for in_message_loop...\n");
+        while(!s->in_message_loop){
+            Sleep(100);
+        }
+
+        PostThreadMessage(GetThreadId(s->hThread), WM_QUIT, 0, 0);
+        //printf("Waiting for thread to finish...\n");
+        WaitForSingleObject(s->hThread, INFINITE);
+        CloseHandle(s->hThread);
+        CloseHandle(s->mutex);
+    }
+
+
     return 0;
 }
 
@@ -886,7 +909,7 @@ static const AVOption options[] = {
     { "video_size", "set video frame size", OFFSET(width), AV_OPT_TYPE_IMAGE_SIZE, {.str = NULL}, 0, 0, DEC },
     { "offset_x", "capture area x offset", OFFSET(offset_x), AV_OPT_TYPE_INT, {.i64 = 0}, INT_MIN, INT_MAX, DEC },
     { "offset_y", "capture area y offset", OFFSET(offset_y), AV_OPT_TYPE_INT, {.i64 = 0}, INT_MIN, INT_MAX, DEC },
-    { "record_events", "Whether to record events and output them as json to stdout", OFFSET(record_events), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, DEC},
+    { "record_events", "Whether to record events and output them as json", OFFSET(record_events), AV_OPT_TYPE_STRING, { .str = "" }, 0, 0, DEC},
     { NULL },
 };
 
